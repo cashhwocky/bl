@@ -1,0 +1,515 @@
+package com.alexdesrosier.lockplayer;
+
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.Outline;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.media.MediaMetadata;
+import android.media.session.MediaController;
+import android.media.session.MediaSessionManager;
+import android.media.session.PlaybackState;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.os.SystemClock;
+import android.text.TextUtils;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.widget.TextView;
+
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.Executors;
+
+import de.robv.android.xposed.XposedBridge;
+
+/**
+ * Lock screen media player: big rounded album art above the fingerprint icon,
+ * title / artist / seek bar / transport pills below it. Lives as an overlay child of
+ * KeyguardRootView, so it fades and hides together with the lock screen.
+ */
+final class LockPlayer {
+
+    private static final String OVERLAY_TAG = "lockplayer_overlay";
+    private static final String SYSUI = "com.android.systemui";
+
+    // ---- tweakables ----
+    private static final float ART_MAX_WIDTH_FRACTION = 0.66f;
+    private static final int ART_RADIUS_DP = 28;
+    private static final int ART_MIN_DP = 110;
+    private static final float CLOCK_FALLBACK_BOTTOM_FRACTION = 0.33f;
+    private static final float ICON_FALLBACK_TOP_FRACTION = 0.78f;
+    private static final int GAP_DP = 18;
+    private static final int SIDE_PAD_DP = 28;
+
+    static void attach(ViewGroup host) {
+        try {
+            if (host.findViewWithTag(OVERLAY_TAG) != null) return;
+            new LockPlayer(host);
+        } catch (Throwable t) {
+            XposedBridge.log("LockPlayer: attach failed: " + t);
+        }
+    }
+
+    private final ViewGroup host;
+    private final Context ctx;
+    private final float dp;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final java.util.concurrent.ExecutorService io = Executors.newSingleThreadExecutor();
+
+    private final FrameLayout overlay;
+    private final ImageView art;
+    private final LinearLayout info;
+    private final ImageView appIcon;
+    private final TextView title, artist, posText, durText;
+    private final SeekBar seek;
+    private final ImageView prevB, playB, nextB;
+
+    private final int accent, onAccent;
+
+    private MediaSessionManager msm;
+    private final List<MediaController> tracked = new ArrayList<>();
+    private MediaController controller;
+    private boolean tracking;
+    private boolean interactive = true;
+    private boolean hasMedia;
+    private String artKey = "";
+    private int artGen;
+
+    // last applied layout (avoid layout loops)
+    private int lArtTop = -1, lArtSize = -1, lInfoTop = -1, lInfoW = -1;
+
+    private LockPlayer(ViewGroup host) {
+        this.host = host;
+        this.ctx = host.getContext();
+        this.dp = ctx.getResources().getDisplayMetrics().density;
+
+        accent = safeColor(android.R.color.system_accent1_200, 0xFFF4A99B);
+        onAccent = safeColor(android.R.color.system_accent1_900, 0xFF3A0B05);
+
+        overlay = new FrameLayout(ctx);
+        overlay.setTag(OVERLAY_TAG);
+        overlay.setId(View.generateViewId()); // ConstraintSet requires ids on all children
+        overlay.setTranslationZ(50f);
+        overlay.setVisibility(View.GONE);
+
+        // album art
+        art = new ImageView(ctx);
+        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        art.setBackground(rounded(0x33FFFFFF, ART_RADIUS_DP));
+        final float radius = ART_RADIUS_DP * dp;
+        art.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View v, Outline o) {
+                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), radius);
+            }
+        });
+        art.setClipToOutline(true);
+        overlay.addView(art, new FrameLayout.LayoutParams(px(200), px(200),
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+
+        // info block
+        info = new LinearLayout(ctx);
+        info.setOrientation(LinearLayout.VERTICAL);
+        info.setGravity(Gravity.CENTER_HORIZONTAL);
+
+        LinearLayout titleRow = new LinearLayout(ctx);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER);
+        appIcon = new ImageView(ctx);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(px(16), px(16));
+        ilp.rightMargin = px(7);
+        titleRow.addView(appIcon, ilp);
+        title = text(15, Color.WHITE, true);
+        titleRow.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        info.addView(titleRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        artist = text(12, 0xB3FFFFFF, false);
+        info.addView(artist, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        seek = new SeekBar(ctx);
+        seek.setProgressTintList(ColorStateList.valueOf(accent));
+        seek.setThumbTintList(ColorStateList.valueOf(accent));
+        seek.setProgressBackgroundTintList(ColorStateList.valueOf(0x55FFFFFF));
+        seek.setSplitTrack(false);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.topMargin = px(10);
+        info.addView(seek, slp);
+
+        LinearLayout times = new LinearLayout(ctx);
+        times.setOrientation(LinearLayout.HORIZONTAL);
+        posText = text(10, 0xB3FFFFFF, false);
+        durText = text(10, 0xB3FFFFFF, false);
+        times.addView(posText, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        durText.setGravity(Gravity.END);
+        times.addView(durText, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp.leftMargin = px(4);
+        tlp.rightMargin = px(4);
+        info.addView(times, tlp);
+
+        LinearLayout controls = new LinearLayout(ctx);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        prevB = pill(android.R.drawable.ic_media_previous, 0x26FFFFFF, Color.WHITE);
+        playB = pill(android.R.drawable.ic_media_play, accent, onAccent);
+        nextB = pill(android.R.drawable.ic_media_next, 0x26FFFFFF, Color.WHITE);
+        controls.addView(prevB, ctl(1f));
+        controls.addView(playB, ctl(1.7f));
+        controls.addView(nextB, ctl(1f));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, px(54));
+        clp.topMargin = px(8);
+        info.addView(controls, clp);
+
+        overlay.addView(info, new FrameLayout.LayoutParams(px(300),
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+
+        wireUp();
+
+        host.addView(overlay, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        host.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (overlay.getVisibility() == View.VISIBLE) reposition();
+        });
+
+        startSessions();
+        startScreenState();
+    }
+
+    // ------------------------------------------------------------------ UI wiring
+
+    private void wireUp() {
+        prevB.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().skipToPrevious(); });
+        nextB.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().skipToNext(); });
+        playB.setOnClickListener(v -> {
+            if (controller == null) return;
+            PlaybackState s = controller.getPlaybackState();
+            if (s != null && s.getState() == PlaybackState.STATE_PLAYING) {
+                controller.getTransportControls().pause();
+            } else {
+                controller.getTransportControls().play();
+            }
+        });
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                if (fromUser) posText.setText(fmt(p));
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) { tracking = true; }
+            @Override public void onStopTrackingTouch(SeekBar sb) {
+                tracking = false;
+                if (controller != null) controller.getTransportControls().seekTo(sb.getProgress());
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ sessions
+
+    private final MediaController.Callback callback = new MediaController.Callback() {
+        @Override public void onMetadataChanged(MediaMetadata m) { refresh(); }
+        @Override public void onPlaybackStateChanged(PlaybackState s) { refresh(); }
+        @Override public void onSessionDestroyed() { main.post(() -> retrack(null)); }
+    };
+
+    private final MediaSessionManager.OnActiveSessionsChangedListener sessionsListener =
+            list -> main.post(() -> retrack(list));
+
+    private void startSessions() {
+        try {
+            msm = (MediaSessionManager) ctx.getSystemService(Context.MEDIA_SESSION_SERVICE);
+            msm.addOnActiveSessionsChangedListener(null, sessionsListener, main);
+            retrack(msm.getActiveSessions(null));
+        } catch (Throwable t) {
+            XposedBridge.log("LockPlayer: session setup failed: " + t);
+        }
+    }
+
+    private void retrack(List<MediaController> list) {
+        for (MediaController c : tracked) {
+            try { c.unregisterCallback(callback); } catch (Throwable ignored) { }
+        }
+        tracked.clear();
+        if (list == null) {
+            try { list = msm.getActiveSessions(null); } catch (Throwable ignored) { }
+        }
+        if (list != null) {
+            for (MediaController c : list) {
+                try { c.registerCallback(callback, main); tracked.add(c); } catch (Throwable ignored) { }
+            }
+        }
+        refresh();
+    }
+
+    private MediaController choose() {
+        for (MediaController c : tracked) {
+            PlaybackState s = c.getPlaybackState();
+            if (s != null && s.getState() == PlaybackState.STATE_PLAYING) return c;
+        }
+        for (MediaController c : tracked) {
+            PlaybackState s = c.getPlaybackState();
+            if (c.getMetadata() != null && s != null
+                    && s.getState() != PlaybackState.STATE_STOPPED
+                    && s.getState() != PlaybackState.STATE_NONE
+                    && s.getState() != PlaybackState.STATE_ERROR) return c;
+        }
+        return null;
+    }
+
+    private void refresh() {
+        controller = choose();
+        hasMedia = controller != null;
+        applyVisibility();
+        if (!hasMedia) { main.removeCallbacks(ticker); return; }
+
+        MediaMetadata md = controller.getMetadata();
+        String t = md != null ? md.getString(MediaMetadata.METADATA_KEY_TITLE) : null;
+        String a = md != null ? md.getString(MediaMetadata.METADATA_KEY_ARTIST) : null;
+        if (a == null && md != null) a = md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
+        title.setText(TextUtils.isEmpty(t) ? "Unknown" : t);
+        artist.setText(a == null ? "" : a);
+
+        try {
+            appIcon.setImageDrawable(ctx.getPackageManager()
+                    .getApplicationIcon(controller.getPackageName()));
+        } catch (Throwable e) {
+            appIcon.setImageDrawable(null);
+        }
+
+        bindArt(md);
+
+        PlaybackState s = controller.getPlaybackState();
+        boolean playing = s != null && s.getState() == PlaybackState.STATE_PLAYING;
+        playB.setImageResource(playing ? android.R.drawable.ic_media_pause
+                : android.R.drawable.ic_media_play);
+        long actions = s != null ? s.getActions() : 0;
+        prevB.setAlpha((actions & PlaybackState.ACTION_SKIP_TO_PREVIOUS) != 0 ? 1f : 0.35f);
+        nextB.setAlpha((actions & PlaybackState.ACTION_SKIP_TO_NEXT) != 0 ? 1f : 0.35f);
+
+        long dur = md != null ? md.getLong(MediaMetadata.METADATA_KEY_DURATION) : 0;
+        boolean seekable = dur > 0;
+        seek.setEnabled(seekable && (actions & PlaybackState.ACTION_SEEK_TO) != 0);
+        seek.setMax(seekable ? (int) Math.min(dur, Integer.MAX_VALUE) : 1);
+        durText.setText(seekable ? fmt(dur) : "");
+        tick();
+        main.removeCallbacks(ticker);
+        if (playing) main.postDelayed(ticker, 500);
+    }
+
+    private final Runnable ticker = new Runnable() {
+        @Override public void run() {
+            tick();
+            main.postDelayed(this, 500);
+        }
+    };
+
+    private void tick() {
+        if (controller == null || tracking) return;
+        PlaybackState s = controller.getPlaybackState();
+        if (s == null) return;
+        long pos = s.getPosition();
+        if (s.getState() == PlaybackState.STATE_PLAYING) {
+            pos += (long) ((SystemClock.elapsedRealtime() - s.getLastPositionUpdateTime())
+                    * s.getPlaybackSpeed());
+        }
+        if (pos < 0) pos = 0;
+        if (pos > seek.getMax()) pos = seek.getMax();
+        seek.setProgress((int) pos);
+        posText.setText(seek.getMax() > 1 ? fmt(pos) : "");
+    }
+
+    // ------------------------------------------------------------------ album art
+
+    private void bindArt(MediaMetadata md) {
+        if (md == null) return;
+        Bitmap bmp = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+        if (bmp == null) bmp = md.getBitmap(MediaMetadata.METADATA_KEY_ART);
+        if (bmp == null) bmp = md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON);
+        String key = md.getString(MediaMetadata.METADATA_KEY_TITLE) + "|"
+                + md.getString(MediaMetadata.METADATA_KEY_ALBUM) + "|"
+                + (bmp != null ? bmp.getGenerationId() + ":" + bmp.getWidth() : "nobmp");
+        if (key.equals(artKey)) return;
+
+        if (bmp != null) {
+            artKey = key;
+            artGen++;
+            art.setImageBitmap(bmp);
+            return;
+        }
+        String uriStr = md.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI);
+        if (uriStr == null) uriStr = md.getString(MediaMetadata.METADATA_KEY_ART_URI);
+        if (uriStr == null) uriStr = md.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI);
+        artKey = key;
+        final int gen = ++artGen;
+        if (uriStr == null) { art.setImageDrawable(null); return; }
+        final Uri uri = Uri.parse(uriStr);
+        io.execute(() -> {
+            Bitmap b = null;
+            try (InputStream in = ctx.getContentResolver().openInputStream(uri)) {
+                if (in != null) b = BitmapFactory.decodeStream(in);
+            } catch (Throwable ignored) { }
+            final Bitmap result = b;
+            main.post(() -> { if (gen == artGen) art.setImageBitmap(result); });
+        });
+    }
+
+    // ------------------------------------------------------------------ visibility
+
+    private void startScreenState() {
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            interactive = pm.isInteractive();
+            IntentFilter f = new IntentFilter();
+            f.addAction(Intent.ACTION_SCREEN_ON);
+            f.addAction(Intent.ACTION_SCREEN_OFF);
+            ctx.registerReceiver(new BroadcastReceiver() {
+                @Override public void onReceive(Context c, Intent i) {
+                    interactive = Intent.ACTION_SCREEN_ON.equals(i.getAction());
+                    applyVisibility();
+                }
+            }, f, Context.RECEIVER_EXPORTED);
+        } catch (Throwable t) {
+            XposedBridge.log("LockPlayer: screen state failed: " + t);
+        }
+        applyVisibility();
+    }
+
+    private void applyVisibility() {
+        boolean show = hasMedia && interactive; // hidden on AOD / screen off
+        overlay.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) host.post(this::reposition);
+    }
+
+    // ------------------------------------------------------------------ layout
+
+    private void reposition() {
+        int w = host.getWidth(), h = host.getHeight();
+        if (w == 0 || h == 0) return;
+        int[] hl = new int[2];
+        host.getLocationOnScreen(hl);
+
+        // fingerprint / device-entry icon
+        int iconTop = (int) (h * ICON_FALLBACK_TOP_FRACTION), iconBottom = iconTop + px(70);
+        View icon = byName("device_entry_icon_view");
+        if (icon != null && icon.getHeight() > 0 && icon.getVisibility() != View.GONE) {
+            int[] il = new int[2];
+            icon.getLocationOnScreen(il);
+            iconTop = il[1] - hl[1];
+            iconBottom = iconTop + icon.getHeight();
+        }
+
+        // clock
+        int clockBottom = (int) (h * CLOCK_FALLBACK_BOTTOM_FRACTION);
+        View clock = byName("lockscreen_clock_view");
+        if (clock != null && clock.getHeight() > 0 && clock.getVisibility() == View.VISIBLE) {
+            int[] cl = new int[2];
+            clock.getLocationOnScreen(cl);
+            int cb = cl[1] - hl[1] + clock.getHeight();
+            if (cb > h * 0.15f && cb < h * 0.5f) clockBottom = cb;
+        }
+
+        int artTop = clockBottom + px(GAP_DP);
+        int avail = iconTop - px(GAP_DP) - artTop;
+        int size = Math.max(px(ART_MIN_DP), Math.min(avail, (int) (w * ART_MAX_WIDTH_FRACTION)));
+
+        int infoW = w - 2 * px(SIDE_PAD_DP);
+        info.measure(View.MeasureSpec.makeMeasureSpec(infoW, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        int infoH = info.getMeasuredHeight();
+        int infoTop = Math.min(iconBottom + px(10), h - infoH - px(36));
+
+        if (size == lArtSize && artTop == lArtTop && infoTop == lInfoTop && infoW == lInfoW) return;
+        lArtSize = size; lArtTop = artTop; lInfoTop = infoTop; lInfoW = infoW;
+
+        FrameLayout.LayoutParams alp = (FrameLayout.LayoutParams) art.getLayoutParams();
+        alp.width = size; alp.height = size; alp.topMargin = artTop;
+        art.setLayoutParams(alp);
+
+        FrameLayout.LayoutParams ilp = (FrameLayout.LayoutParams) info.getLayoutParams();
+        ilp.width = infoW; ilp.topMargin = infoTop;
+        info.setLayoutParams(ilp);
+    }
+
+    private View byName(String name) {
+        int id = ctx.getResources().getIdentifier(name, "id", SYSUI);
+        return id == 0 ? null : host.findViewById(id);
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    private int px(int v) { return Math.round(v * dp); }
+
+    private int safeColor(int res, int fallback) {
+        try { return ctx.getColor(res); } catch (Throwable t) { return fallback; }
+    }
+
+    private TextView text(int sp, int color, boolean bold) {
+        TextView tv = new TextView(ctx);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        tv.setTextColor(color);
+        tv.setSingleLine(true);
+        tv.setEllipsize(TextUtils.TruncateAt.END);
+        tv.setGravity(Gravity.CENTER);
+        tv.setIncludeFontPadding(false);
+        tv.setTypeface(Typeface.create(bold ? "sans-serif-medium" : "sans-serif", Typeface.NORMAL));
+        tv.setMaxWidth(px(260));
+        return tv;
+    }
+
+    private GradientDrawable rounded(int color, int radiusDp) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(radiusDp * dp);
+        return g;
+    }
+
+    private ImageView pill(int iconRes, int bg, int fg) {
+        ImageView v = new ImageView(ctx);
+        v.setImageResource(iconRes);
+        v.setColorFilter(fg);
+        v.setScaleType(ImageView.ScaleType.CENTER);
+        Drawable base = rounded(bg, 22);
+        Drawable mask = rounded(Color.WHITE, 22);
+        v.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), base, mask));
+        v.setClickable(true);
+        return v;
+    }
+
+    private LinearLayout.LayoutParams ctl(float weight) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.MATCH_PARENT, weight);
+        lp.leftMargin = px(3);
+        lp.rightMargin = px(3);
+        return lp;
+    }
+
+    private static String fmt(long ms) {
+        long s = Math.max(0, ms / 1000);
+        return String.format(Locale.US, "%d:%02d", s / 60, s % 60);
+    }
+}
