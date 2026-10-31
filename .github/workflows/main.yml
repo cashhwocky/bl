@@ -410,7 +410,7 @@ jobs:
               private void startSessions() {
                   try {
                       msm = (MediaSessionManager) ctx.getSystemService(Context.MEDIA_SESSION_SERVICE);
-                      msm.addOnActiveSessionsChangedListener(null, sessionsListener, main);
+                      msm.addOnActiveSessionsChangedListener(sessionsListener, null, main);
                       retrack(msm.getActiveSessions(null));
                   } catch (Throwable t) {
                       XposedBridge.log("LockPlayer: session setup failed: " + t);
